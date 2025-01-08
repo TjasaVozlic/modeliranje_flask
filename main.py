@@ -221,8 +221,11 @@ def waspas_methods():
     for rank, item in enumerate(ranked_waspas, start=1):
         item["waspas_rank"] = rank
 
-    # Return the final ranked data as JSON response
-    return jsonify(ranked_data)
+        # Sort the final ranked data by WASPAS ranks
+    ranked_data_sorted_by_waspas = sorted(ranked_data, key=lambda x: x["waspas_rank"])
+
+    # Return the final ranked data sorted by WASPAS rank as JSON response
+    return jsonify(ranked_data_sorted_by_waspas)
 
 
 @app.route('/data', methods=['GET'])
@@ -264,6 +267,106 @@ def get_data():
             "criteria": criteria,  # List of criteria names
             "data_matrix": matrix_list  # Matrix with company data
         })
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+@app.route('/ensemble', methods=['POST'])
+def ensemble_method():
+    try:
+        # Pridobimo uteži kriterijev in metode
+        criteria = request.json.get("weights")
+        preference_function = request.json.get("preference_function")
+
+        # Extract criteria and weights
+        column_order = list(criteria.keys())  # Column order based on criteria
+        weights = np.array([criteria[col] for col in column_order])  # Convert weights to numpy array
+
+        # Get the decision matrix from your DataFrame
+        decision_matrix = df[column_order].to_numpy()  # Matrix with columns in the correct order
+
+        # Define the types of criteria (1 for benefit, -1 for cost)
+        types = np.array(['max' if col not in ['debt_to_equity_ratio'] else 'min' for col in column_order])
+
+        # Run individual methods
+        topsis_response = topsis_method(decision_matrix, weights, types, graph=False, verbose=False)
+
+        normalized_matrix = normalize_criteria(decision_matrix, list(types))
+        Q = [0.1 for _ in range(len(column_order))]
+        S = [0.3 for _ in range(len(column_order))]
+        P = [0.6 for _ in range(len(column_order))]
+        F = [preference_function for _ in range(len(column_order))]
+        promethee_response = promethee_ii(normalized_matrix, W=weights, Q=Q, S=S, P=P, F=F, sort=False, graph=False)
+
+        wsm, wpm, waspas_response = waspas_method(decision_matrix, types, weights, 0.5, graph=False)
+
+        normalized_matrix_ahp = normalize_criteria_ahp(df[column_order].to_numpy(), list(types))
+        prioritetna_matrika = np.zeros((len(df), len(column_order)))
+        for i in range(len(column_order)):
+            prioritetna_matrika[:, i] = build_comparison_matrix(normalized_matrix_ahp, i)
+        ahp_response = np.dot(prioritetna_matrika, weights)
+
+        # Convert AHP response into rankable data
+        ahp_ranks =[{"name": name, "rank": rank + 1} for rank, (name, _) in enumerate(
+            sorted(zip(df['Name'], topsis_response), key=lambda x: x[1], reverse=True)
+        )]
+
+        # Convert other methods' results into rankable data
+        topsis_ranks = [{"name": name, "rank": rank + 1} for rank, (name, _) in enumerate(
+            sorted(zip(df['Name'], topsis_response), key=lambda x: x[1], reverse=True)
+        )]
+
+        promethee_ranks = [{"name": name, "rank": rank + 1} for rank, (name, _) in enumerate(
+            sorted(zip(df['Name'], promethee_response[:, 1]), key=lambda x: x[1], reverse=True)
+        )]
+
+        waspas_ranks = [{"name": name, "rank": rank + 1} for rank, (name, score) in enumerate(
+            sorted(zip(df['Name'], waspas_response), key=lambda x: x[1], reverse=True)
+        )]
+
+        # Combine ranks for each company
+        # Combine ranks for each company
+        ensemble_ranks = {}
+        for method_ranks, method_name in zip([ahp_ranks, topsis_ranks, promethee_ranks, waspas_ranks],
+                                             ["ahp_rank", "topsis_rank", "promethee_rank", "waspas_rank"]):
+            for rank in method_ranks:
+                if rank["name"] not in ensemble_ranks:
+                    ensemble_ranks[rank["name"]] = {
+                        "total_rank": 0,  # Initialize total rank
+                        "ahp_rank": None,
+                        "topsis_rank": None,
+                        "promethee_rank": None,
+                        "waspas_rank": None
+                    }
+                # Assign rank to the appropriate key
+                ensemble_ranks[rank["name"]][method_name] = rank["rank"]
+                ensemble_ranks[rank["name"]]["total_rank"] += rank["rank"]
+
+        # Convert combined ranks into sorted data
+        final_scores = sorted(
+            [{"name": name, "total_rank": int(total_rank["total_rank"]),
+              "ahp_rank": total_rank["ahp_rank"],
+              "topsis_rank": total_rank["topsis_rank"],
+              "promethee_rank": total_rank["promethee_rank"],
+              "waspas_rank": total_rank["waspas_rank"]}
+             for name, total_rank in ensemble_ranks.items()],
+            key=lambda x: x["total_rank"]
+        )
+
+        # Assign final ranks
+        for rank, entry in enumerate(final_scores, start=1):
+            entry["final_rank"] = rank
+
+        # Return the name, final rank, and summed ranks along with individual method ranks
+        return jsonify([
+            {"name": entry["name"],
+             "final_rank": entry["final_rank"],
+             "sum_of_ranks": entry["total_rank"],
+             "ahp_rank": entry["ahp_rank"],
+             "topsis_rank": entry["topsis_rank"],
+             "promethee_rank": entry["promethee_rank"],
+             "waspas_rank": entry["waspas_rank"]}
+            for entry in final_scores
+        ])
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
